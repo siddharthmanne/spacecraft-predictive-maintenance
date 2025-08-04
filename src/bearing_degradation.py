@@ -1,6 +1,14 @@
 
 """
-Uses physics to simulate bearing degradation. 
+Module: bearing_degradation.py
+
+Description:
+This module implements a physics-based bearing degradation simulation model for spacecraft components (e.g., reaction wheels).
+It contains the BearingState dataclass that encapsulates physical state parameters of the bearing,
+and the BearingDegradationModel class that simulates time-dependent wear, lubrication degradation,
+multi-factor friction development, and physical state updates based on operating conditions.
+The model uses established physics laws and empirical constants calibrated from aerospace literature,
+and supports caching of expensive calculations for performance.
 """
 
 import numpy as np
@@ -8,6 +16,7 @@ from typing import Dict, Tuple, Optional
 from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
+import copy
 
 @dataclass
 class BearingState:
@@ -38,13 +47,12 @@ class BearingDegradationModel:
 
         # Physics constants derived from bearing engineering literature
         self.physics_constants = {
-            'wear_rate_base': 1.2e-10,           # Base wear per operating hour
-            'friction_wear_factor': 1.5,      # How friction accelerates wear
+            'wear_rate_base': 8.0e-5,           # Base wear per operating hour that alligns with literature-based 3-5 year operating range without maintenance for spacecraft bearings
             'activation_energy_ratio': 0.045,
             'load_stress_exponent': 1.33,      # Load stress relationship
             # 'vibration_threshold': 0.01,      # g-force threshold for damage
-            'lubrication_depletion_rate': 2.1e-7, # Per operating hour
-            'critical_temperature_threshold': 36.0,  # NASA maximum test temperature
+            'lubrication_depletion_rate': 1.5e-6, # Per operating hour
+            'critical_temperature_threshold': 55.0,  # Temp at which lubrication quality begins decreasing significantly
             'lubrication_temp_factor' : 0.08, #accelerated depltion at high temp
             'surface_roughness_factor': 0.1,       # μm increase per wear unit
             'friction_increase_factor': 0.3,        # Friction coefficient increase
@@ -62,10 +70,10 @@ class BearingDegradationModel:
         Output: New BearingState with updated physical properties (wear level, surface roughness, etc)
         """
         # Check cache first
-        cache_key = self.generate_cache_key(current_state, operating_conditions, time_delta_hours)
+        cache_key = self._generate_cache_key(current_state, operating_conditions, time_delta_hours)
         if cache_key in self._physics_cache:
             self.cache_hits += 1
-            return self._physics_cache[cache_key].copy()
+            return copy.deepcopy(self._physics_cache[cache_key])
         
         self.cache_misses += 1
 
@@ -122,7 +130,7 @@ class BearingDegradationModel:
 
         # Create new state
         new_state = BearingState(
-            wear_level=min(1.0, current_state.wear_level + total_wear_increment),
+            wear_level=min(1.0, max(0, current_state.wear_level + total_wear_increment)), # Ensures wear level is relative value between 0 and 1
             friction_coefficient=new_friction,
             surface_roughness=new_surface_roughness,
             lubrication_quality=max(0.0, current_state.lubrication_quality - lubrication_loss),
@@ -167,8 +175,8 @@ class BearingDegradationModel:
         #Combined wear acceleration
         total_acceleration = wear_factor * lube_factor * roughness_factor
 
-        # Cap acceleration to prevent numerical instability (5x max)
-        return min(5.0, total_acceleration)
+        # Cap acceleration to prevent numerical instability (q5x max)
+        return min(15.0, total_acceleration)
 
     def _calculate_lubrication_loss(self, bearing_state: BearingState, temperature: float, time_delta_hours: float) -> float:
         """
@@ -192,10 +200,10 @@ class BearingDegradationModel:
         # Base depletion rate (evaporation + oxidation)
         base_loss = self.physics_constants['lubrication_depletion_rate'] * time_delta_hours
         # Temperature acceleration 
-        if temperature > self.physics_constants['critical_temperature']:
+        if temperature > self.physics_constants['critical_temperature_threshold']:
             temp_acceleration = 1.0 + (
                 self.physics_constants['lubrication_temp_factor'] * 
-                (temperature - self.physics_constants['critical_temperature'])
+                (temperature - self.physics_constants['critical_temperature_threshold'])
             )
         else:
             temp_acceleration = 1.0
@@ -209,7 +217,8 @@ class BearingDegradationModel:
         
         return total_loss
     
-    def _calculate_friction_coefficient(self, bearing_state: BearingState, wear_increment: float) -> float:
+    def _calculate_friction_coefficient(self, bearing_state: BearingState, wear_increment: float) -> float: 
+        """ WHAT IS THE ROLE OF SECOND PARAMETER"""
         """
         Calculate friction coefficient based on surface condition and lubrication.
         
@@ -248,7 +257,7 @@ class BearingDegradationModel:
         new_friction = (base_friction + roughness_increase + wear_contribution) * lube_multiplier
         
         # Physical limits for steel bearings
-        return min(new_friction, 0.15)  # Maximum reasonable friction coefficient
+        return min(new_friction, 0.20)  # Maximum reasonable friction coefficient
 
 
 
@@ -273,7 +282,7 @@ class BearingDegradationModel:
         load_factor = conditions.get('load_factor', 1.0)
         
         # Calculate wear rate under expected conditions
-        temp_factor = np.exp(self.physics_constants['temperature_acceleration'] * (temperature - 20.0))
+        temp_factor = np.exp(self.physics_constants['activation_energy_ratio'] * (temperature - 20.0))
         load_factor_adj = load_factor ** self.physics_constants['load_stress_exponent']
         
         hourly_wear_rate = (
