@@ -1,5 +1,6 @@
 Need to implement:
 - a safety mechanism that detects if we use fallback values too much (defaults for temp, vibration, etc) and flags an error in all my test files
+- format all constants used in a good way
 
 Information flow:
 Physics Models (bearing degradation, raw physics) → Subsystem Classes (eg. reaction wheel subsystem) → System Orchestrator (telemetry generator)

@@ -12,6 +12,29 @@ from src.bearing_degradation import BearingDegradationModel, BearingState
 
 
 class ReactionWheelSubsystem:
+
+    # Vibration conversion constants (literature-based)
+    BASE_VIBRATION = 0.01  # g, minimum healthy wheel baseline
+    VIBRATION_WEAR_GAIN = 0.04  # g per unit wear
+    VIBRATION_ROUGHNESS_GAIN = 0.07  # g per μm roughness above baseline  
+    VIBRATION_FRICTION_GAIN = 0.1  # g per unit friction above 0.02
+    ROUGHNESS_BASELINE = 0.32  # μm, new bearing baseline
+    FRICTION_BASELINE = 0.02  # baseline friction for vibration calculation
+    
+    # Current draw constants (literature-based)
+    IDLE_CURRENT = 0.08  # A, low-load (0.05–0.12A typical for cubesat class)
+    CURRENT_GAIN = 0.3  # A per unit friction * speed/1000
+    
+    # Temperature constants (literature-based)
+    AMBIENT_TEMP = 20.0  # deg C, typical spacecraft housing
+    TEMP_FRICTION_GAIN = 3.0  # deg C per friction*load_factor
+    
+    # Performance metrics constants (literature-based)
+    MAX_TORQUE_NM = 0.05  # Newton meter, de-rates as wear grows
+    POINTING_JITTER_BASE_ARCSEC = 0.1  # arcsec, best-case pointing stability
+    POINTING_JITTER_VIBRATION_GAIN = 20  # arcsec per 0.01g increase in vibration
+
+
     def __init__(self, 
                 wheel_id=0, # Since most real spacecraft have 3–4 reaction wheels (for full 3-axis + redundancy control)
                 operational_mode='IDLE', # "IDLE" is a common and safe default state in spacecraft systems. UI allows users to select or change operational modes (such as 'IDLE', 'NOMINAL', 'SAFE', 'HIGH_TORQUE', etc.)
@@ -44,7 +67,7 @@ class ReactionWheelSubsystem:
 
         op_conditions = {
             'speed_rpm': speed_rpm,
-            'bearing_temp': bearing_temp,
+            'bearing_temperature': bearing_temp,
             'load_factor': load_factor,
         }
         
@@ -75,7 +98,7 @@ class ReactionWheelSubsystem:
         }
 
 
-    def _physics_to_vibration(bearing_physics):
+    def _physics_to_vibration(self, bearing_physics):
         """
         Converts physics state to vibration RMS (arbitrary units for demo).
         Vibration increases as wear, roughness, and friction rise.
@@ -83,19 +106,14 @@ class ReactionWheelSubsystem:
         Literature: Vibration from reaction wheels is commonly characterized by RMS amplitude in g or m/s², typically on the order of 0.01–0.1g for healthy small wheels. 
         Vibration increases nonlinearly as bearing wear or roughness grows, with literature describing increases of 2–10 times in failing bearings.
         """
-        BASE_VIBRATION = 0.01  # g, minimum healthy wheel baseline
-        VIBRATION_WEAR_GAIN = 0.04  # g per unit wear
-        VIBRATION_ROUGHNESS_GAIN = 0.07  # g per μm roughness above baseline
-        VIBRATION_FRICTION_GAIN = 0.1   # g per unit friction above 0.02
-
-        vib = (BASE_VIBRATION
-               + VIBRATION_WEAR_GAIN * physics['wear_level']
-               + VIBRATION_ROUGHNESS_GAIN * max(0, physics['surface_roughness'] - 0.32)
-               + VIBRATION_FRICTION_GAIN * (physics['friction_coefficient'] - 0.02))
+        vib = (self.BASE_VIBRATION
+               + self.VIBRATION_WEAR_GAIN * bearing_physics['wear_level']
+               + self.VIBRATION_ROUGHNESS_GAIN * max(0, bearing_physics['surface_roughness'] - self.ROUGHNESS_BASELINE)
+               + self.VIBRATION_FRICTION_GAIN * (bearing_physics['friction_coefficient'] - self.FRICTION_BASELINE))
         return vib
 
 
-    def _physics_to_current(bearing_physics, wheel_speed):
+    def _physics_to_current(self, bearing_physics, wheel_speed):
         """
         Estimates motor current draw (A).
         Increases with friction and wheel speed.
@@ -104,14 +122,11 @@ class ReactionWheelSubsystem:
         Current rises by ~0.2–0.5A per 0.1 increase in friction coefficient and climbs rapidly at high RPM. 
         Scaling by friction and RPM is supported by hardware models and NASA jitter reports.
         """
-        IDLE_CURRENT = 0.08  # A, low-load (0.05–0.12A typical for cubesat class)[64]
-        CURRENT_GAIN = 0.3   # A per unit friction * speed/1000
-
-        load = CURRENT_GAIN * physics['friction_coefficient'] * abs(wheel_speed) / 1000.0
-        return IDLE_CURRENT + load
+        load = self.CURRENT_GAIN * bearing_physics['friction_coefficient'] * abs(wheel_speed) / 1000.0
+        return self.IDLE_CURRENT + load
 
 
-    def _physics_to_temperature(bearing_physics, operational_load):
+    def _physics_to_temperature(self, bearing_physics, operational_load):
         """
         Approximates wheel housing temperature (deg C).
         Increases with operating load and friction.
@@ -120,10 +135,8 @@ class ReactionWheelSubsystem:
         but with increased friction and load, rises of +2–5°C or more are plausible, especially in vacuum or poor conduction cases.
 
         """
-        AMBIENT_TEMP = 20.0
-        TEMP_FRICTION_GAIN = 3.0  
-        delta = TEMP_FRICTION_GAIN * physics['friction_coefficient'] * operational_load
-        return AMBIENT_TEMP + delta
+        delta = self.TEMP_FRICTION_GAIN * bearing_physics['friction_coefficient'] * operational_load
+        return self.AMBIENT_TEMP + delta
 
     def get_performance_metrics(self):
         """
@@ -132,16 +145,13 @@ class ReactionWheelSubsystem:
         Torque: Maximum torque in Nm for a small wheel is typically around 0.03–0.08Nm, and drops proportionally as wear increases and friction rises.
         Point Jitter: Pointing stability can typically be maintained <1 arcsec for high-quality systems, but can degrade by up to 10–50 arcsec in the presence of high vibration or degraded wheels.
         """
-        MAX_TORQUE_NM = 0.05                             # Newton meter, de-rates as wear grows (engineering typical)
-        POINTING_JITTER_BASE_ARCSEC = 0.1                # arcsec, best-case pointing stability (high-precision mission)
-        POINTING_JITTER_VIBRATION_GAIN = 20              # arcsec per .01g increase in vibration
         metrics = {
-            'max_torque_Nm': max(0.0, MAX_TORQUE_NM * (1 - self.bearing_state.wear_level)),  # Declines with wear
-            'pointing_jitter_arcsec': POINTING_JITTER_BASE_ARCSEC + POINTING_JITTER_VIBRATION_GAIN * self.latest_telemetry.get('measured_vibration', 0.01)  # Vibration causes pointing error
+            'max_torque_Nm': max(0.0, self.MAX_TORQUE_NM * (1 - self.bearing_state.wear_level)),  # Declines with wear
+            'pointing_jitter_arcsec': self.POINTING_JITTER_BASE_ARCSEC + self.POINTING_JITTER_VIBRATION_GAIN * self.latest_telemetry.get('measured_vibration', 0.01)  # Vibration causes pointing error
         }
         return metrics
      
-    def predict_maintenance_timeline(current_state, mission_profile):
+    def predict_maintenance_timeline(self, current_state, mission_profile):
         """
         Projects maintenance/failure horizon (hours) using internal physics.
         mission_profile: dict with typical profile for coming operation (temp, load_factor)
