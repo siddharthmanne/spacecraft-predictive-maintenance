@@ -1,3 +1,6 @@
+Need to implement:
+- a safety mechanism that detects if we use fallback values too much (defaults for temp, vibration, etc) and flags an error in all my test files
+
 Information flow:
 Physics Models (bearing degradation, raw physics) → Subsystem Classes (eg. reaction wheel subsystem) → System Orchestrator (telemetry generator)
 
@@ -33,6 +36,17 @@ Sensor Processor ↔ Telemetry Generator:
 - Sensor provides: "Temperature reading: 23.7°C with 0.1°C bias"
 - Telemetry packages: "RW_TEMP: 23.7°C at timestamp 14:35:22"
 
+NOTE ABOUT TEMP:
+Is the Temperature in reaction wheel class the Same as in the Bearing Degradation Model?
+No—they represent two different (but related) physical things:
+In Bearing Degradation Model:
+- Temperature is the internal bearing/grease temperature—a hidden/internal state used by physics to predict wear, lubrication breakdown, etc.
+- This is often idealized or modeled "under the hood" in the bearing model.
+
+In Reaction Wheel class (_physics_to_temperature):
+- Temperature is the external wheel housing temperature—what would actually be measured by a thermistor or telemetered to ground.
+- This is the simulated sensor readout, usually (but not always) correlated with the internal bearing temperature.
+- In real spacecraft, housing temp is often lower than true bearing temp (and may lag physically).
 
 
 
