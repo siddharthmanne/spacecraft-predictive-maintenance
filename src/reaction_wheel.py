@@ -8,6 +8,7 @@ and producing signals ready for telemetry or diagnostics.
 Integrates user commands, mission profiles, and bearing physics for E2E RW modeling.
 """
 
+import random
 from src.bearing_degradation import BearingDegradationModel, BearingState
 
 
@@ -24,10 +25,13 @@ class ReactionWheelSubsystem:
     # Current draw constants (literature-based)
     IDLE_CURRENT = 0.08  # A, low-load (0.05–0.12A typical for cubesat class)
     CURRENT_GAIN = 0.3  # A per unit friction * speed/1000
+    CURRENT_SPIKE_PROBABILITY = 0.05  # 5% chance of current spike during rapid friction changes
+    CURRENT_SPIKE_MAGNITUDE = 2.5  # Spike multiplier for worst-case 200-500% draws
     
     # Temperature constants (literature-based)
-    AMBIENT_TEMP = 20.0  # deg C, typical spacecraft housing
-    TEMP_FRICTION_GAIN = 3.0  # deg C per friction*load_factor
+    HOUSING_TEMPERATURE_BASE = 21.0  # deg C, typical spacecraft housing (updated from 20.0)
+    TEMP_FRICTION_GAIN = 4.0  # deg C per friction*load_factor (increased for realistic heat generation)
+    TEMP_HEAT_GENERATION_FACTOR = 3.5  # Additional temperature rise from friction heat
     
     # Performance metrics constants (literature-based)
     MAX_TORQUE_NM = 0.05  # Newton meter, de-rates as wear grows
@@ -62,43 +66,44 @@ class ReactionWheelSubsystem:
         """
         speed_rpm = commands.get('target_speed_rpm', 0.0)
         load_factor = commands.get('load_factor', self.load_factor) # Incase the user wants to override the mission load factor, they have the oppurtunity to. 
-        bearing_temp = commands.get('bearing_temperature', 20.0)
         dt = commands.get('timestep_hours', 1.0)
 
         op_conditions = {
             'speed_rpm': speed_rpm,
-            'bearing_temperature': bearing_temp,
             'load_factor': load_factor,
         }
         
         # Update bearing state
         self.bearing_state = self.bearing_model.update_bearing_state(self.bearing_state, op_conditions, dt)
-        physics = self.bearing_model.get_physical_properties(self.bearing_state)
 
         # Translate bearing state to subsystem signals
-        vibration = self._physics_to_vibration(physics)
-        current = self._physics_to_current(physics, speed_rpm)
-        housing_temp = self._physics_to_temperature(physics, load_factor)
+        vibration = self._physics_to_vibration()
+        current = self._physics_to_current(speed_rpm)
+        housing_temperature = self._physics_to_housing_temperature(load_factor)
 
     
         # Store for export/streaming
         self.latest_telemetry = {
+            # Intrinsic physical values
             'mission_time_hours': mission_time_hours,
             'mode': commands.get('mode', self.operational_mode),
             'wheel_id': self.wheel_id,
             'speed_rpm': speed_rpm,
             'load_factor': load_factor,
-            'bearing_wear_level': physics['wear_level'],
-            'bearing_friction_coeff': physics['friction_coefficient'],
-            'bearing_surface_roughness': physics['surface_roughness'],
-            'bearing_lubrication_quality': physics['lubrication_quality'],
-            'measured_vibration': vibration,
+            'bearing_wear_level': self.bearing_state.wear_level,
+            'bearing_friction_coeff': self.bearing_state.friction_coefficient,
+            'bearing_surface_roughness': self.bearing_state.surface_roughness,
+            'bearing_lubrication_quality': self.bearing_state.lubrication_quality,
+            'bearing_temperature': self.bearing_state.bearing_temperature,
+
+            # Sensor values
+            'vibration': vibration,
             'motor_current': current,
-            'housing_temperature': housing_temp,
+            'housing_temperature': housing_temperature
         }
 
 
-    def _physics_to_vibration(self, bearing_physics):
+    def _physics_to_vibration(self):
         """
         Converts physics state to vibration RMS (arbitrary units for demo).
         Vibration increases as wear, roughness, and friction rise.
@@ -107,36 +112,55 @@ class ReactionWheelSubsystem:
         Vibration increases nonlinearly as bearing wear or roughness grows, with literature describing increases of 2–10 times in failing bearings.
         """
         vib = (self.BASE_VIBRATION
-               + self.VIBRATION_WEAR_GAIN * bearing_physics['wear_level']
-               + self.VIBRATION_ROUGHNESS_GAIN * max(0, bearing_physics['surface_roughness'] - self.ROUGHNESS_BASELINE)
-               + self.VIBRATION_FRICTION_GAIN * (bearing_physics['friction_coefficient'] - self.FRICTION_BASELINE))
+               + self.VIBRATION_WEAR_GAIN * self.bearing_state.wear_level
+               + self.VIBRATION_ROUGHNESS_GAIN * max(0, self.bearing_state.surface_roughness - self.ROUGHNESS_BASELINE)
+               + self.VIBRATION_FRICTION_GAIN * (self.bearing_state.friction_coefficient - self.FRICTION_BASELINE))
         return vib
 
 
-    def _physics_to_current(self, bearing_physics, wheel_speed):
+    def _physics_to_current(self, wheel_speed):
         """
         Estimates motor current draw (A).
         Increases with friction and wheel speed.
 
         Literature: Idle (zero friction) reaction wheel current for compact wheels is typically around 0.05–0.12A. 
         Current rises by ~0.2–0.5A per 0.1 increase in friction coefficient and climbs rapidly at high RPM. 
-        Scaling by friction and RPM is supported by hardware models and NASA jitter reports.
+        Research shows current can increase by 200-500% in severely degraded bearings.
         """
-        load = self.CURRENT_GAIN * bearing_physics['friction_coefficient'] * abs(wheel_speed) / 1000.0
-        return self.IDLE_CURRENT + load
+        
+        # Base current calculation
+        load = self.CURRENT_GAIN * self.bearing_state.friction_coefficient * abs(wheel_speed) / 1000.0
+        base_current = self.IDLE_CURRENT + load
+        
+        # Stochastic current spikes during rapid friction surges
+        # Simulates worst-case 200-500% draws seen in orbit
+        if (self.bearing_state.friction_coefficient > 0.1 and  # High friction condition
+            random.random() < self.CURRENT_SPIKE_PROBABILITY):
+            spike_multiplier = 1.0 + (self.CURRENT_SPIKE_MAGNITUDE - 1.0) * random.random()
+            return base_current * spike_multiplier
+        
+        return base_current
 
 
-    def _physics_to_temperature(self, bearing_physics, operational_load):
+    def _physics_to_housing_temperature(self, operational_load):
         """
         Approximates wheel housing temperature (deg C).
         Increases with operating load and friction.
 
         Literature: Housing temperature for wheels rarely exceeds ambient by more than a few °C under normal operations, 
         but with increased friction and load, rises of +2–5°C or more are plausible, especially in vacuum or poor conduction cases.
+        Heat generation outweighs dissipation as friction grows, leading to net temperature rise.
 
         """
-        delta = self.TEMP_FRICTION_GAIN * bearing_physics['friction_coefficient'] * operational_load
-        return self.AMBIENT_TEMP + delta
+        # Base temperature rise from friction
+        friction_delta = self.TEMP_FRICTION_GAIN * self.bearing_state.friction_coefficient * operational_load
+
+        wear_heat = 2.0 * self.bearing_state.wear_level * operational_load  # Add wear-driven heat
+
+        lubrication_factor = 1.5 if self.bearing_state.lubrication_quality < 0.3 else 1.0
+        
+        total_heat = (friction_delta + wear_heat) * lubrication_factor
+        return self.HOUSING_TEMPERATURE_BASE + total_heat
 
     def get_performance_metrics(self):
         """

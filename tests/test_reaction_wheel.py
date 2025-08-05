@@ -77,7 +77,7 @@ class TestReactionWheelSubsystem:
             
             # Real-world ranges for new bearing
             assert 0.08 <= telemetry['motor_current'] <= 0.5  # Literature: 0.05-0.12A idle 
-            assert 0.01 <= telemetry['measured_vibration'] <= 0.1  # Literature: 0.01-0.1g healthy wheels
+            assert 0.01 <= telemetry['vibration'] <= 0.1  # Literature: 0.01-0.1g healthy wheels
             assert 20.0 <= telemetry['housing_temperature'] <= 25.0  # Spacecraft typical
     
     def test_zero_rpm_operation(self):
@@ -128,7 +128,7 @@ class TestReactionWheelSubsystem:
         # New bearing baseline
         commands = {'target_speed_rpm': 3000}
         self.wheel.update(1.0, commands)
-        initial_vibration = self.wheel.get_telemetry()['measured_vibration']
+        initial_vibration = self.wheel.get_telemetry()['vibration']
         
         assert abs(initial_vibration - self.wheel.BASE_VIBRATION) < 0.005  # Should be near baseline
         
@@ -138,7 +138,7 @@ class TestReactionWheelSubsystem:
         self.wheel.bearing_state.friction_coefficient = 0.08
         
         self.wheel.update(2.0, commands)
-        degraded_vibration = self.wheel.get_telemetry()['measured_vibration']
+        degraded_vibration = self.wheel.get_telemetry()['vibration']
 
         # Get the actual physics state the model computed
         physics = self.wheel.bearing_model.get_physical_properties(self.wheel.bearing_state)
@@ -173,11 +173,11 @@ class TestReactionWheelSubsystem:
             physics = wheel.bearing_model.get_physical_properties(wheel.bearing_state)
             actual_friction = physics['friction_coefficient']
             
-            # Literature: temp = ambient + (friction × load × gain)
-            expected_temp = self.wheel.AMBIENT_TEMP + (self.wheel.TEMP_FRICTION_GAIN * actual_friction * condition['load_factor'])
+            # Literature: temp = housing_temperature_base + (friction × load × gain)
+            expected_temp = self.wheel.HOUSING_TEMPERATURE_BASE + (self.wheel.TEMP_FRICTION_GAIN * actual_friction * condition['load_factor'])
             
             assert abs(temp - expected_temp) < 0.1
-            assert self.wheel.AMBIENT_TEMP <= temp <= 35.0  # Realistic spacecraft range
+            assert self.wheel.HOUSING_TEMPERATURE_BASE <= temp <= 35.0  # Realistic spacecraft range
 
     # ===============================
     # LONG-TERM DEGRADATION TESTS
@@ -210,7 +210,7 @@ class TestReactionWheelSubsystem:
         assert 0.02 <= final_telemetry['bearing_wear_level'] <= 0.2
         current_increase = final_telemetry['motor_current'] - initial_telemetry['motor_current']
         assert 0.05 <= current_increase <= 0.3
-        assert 0.015 <= final_telemetry['measured_vibration'] <= 0.05
+        assert 0.015 <= final_telemetry['vibration'] <= 0.05
         assert 0.7 <= final_telemetry['bearing_lubrication_quality'] <= 1.0
     
     def test_five_year_degradation(self):
@@ -234,7 +234,7 @@ class TestReactionWheelSubsystem:
 
         assert 0.2 <= final_telemetry['bearing_wear_level'] <= 0.7
         assert 0.15 <= final_telemetry['motor_current'] <= 1.0
-        assert 0.03 <= final_telemetry['measured_vibration'] <= 0.2
+        assert 0.03 <= final_telemetry['vibration'] <= 0.2
         assert 0.2 <= final_telemetry['bearing_lubrication_quality'] <= 0.8
 
     # ===============================
@@ -303,7 +303,7 @@ class TestReactionWheelSubsystem:
         required_fields = [
             'mission_time_hours', 'mode', 'wheel_id', 'speed_rpm', 'load_factor',
             'bearing_wear_level', 'bearing_friction_coeff', 'bearing_surface_roughness',
-            'bearing_lubrication_quality', 'measured_vibration', 'motor_current',
+            'bearing_lubrication_quality', 'vibration', 'motor_current',
             'housing_temperature'
         ]
         
@@ -315,7 +315,7 @@ class TestReactionWheelSubsystem:
         assert 0 <= telemetry['bearing_wear_level'] <= 1.0
         assert 0 <= telemetry['bearing_lubrication_quality'] <= 1.0
         assert telemetry['motor_current'] >= 0
-        assert telemetry['measured_vibration'] >= 0
+        assert telemetry['vibration'] >= 0
 
     # ===============================
     # PARAMETRIZED TESTS FOR COVERAGE
