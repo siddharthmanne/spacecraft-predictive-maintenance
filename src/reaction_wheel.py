@@ -7,9 +7,8 @@ and producing signals ready for telemetry or diagnostics.
 
 Integrates user commands, mission profiles, and bearing physics for E2E RW modeling.
 """
-
 from src.bearing_degradation import BearingDegradationModel, BearingState
-
+import numpy as np
 
 class ReactionWheelSubsystem:
     def __init__(self, 
@@ -25,57 +24,65 @@ class ReactionWheelSubsystem:
         # Telemetry storage
         self.latest_telemetry = {}
 
-    def update(self, mission_time_hours, commands):
+    def update(self, timestep_hours, commands):
         """
         Main orchestration function.
         - Decodes commands to operating conditions
-        - Updates bearing state via physics model
+        - Updates bearing state via physics model for the given timestep
         - Calculates observable effects (current, vibration, temperature)
         - Packages telemetry dictionary
 
         Inputs:
-            mission_time_hours: current mission time (float)
+            timestep_hours: time to advance simulation in hours
             commands: dict, e.g. {'target_speed_rpm': 3600, 'load_factor': 1.2, 'mode': 'NOMINAL'}
+            
+        Note: The bearing model's update_bearing_state_one_hour() must be called
+        once for each hour in the timestep to properly simulate wear progression.
         """
         speed_rpm = commands.get('target_speed_rpm', 0.0)
-        load_factor = commands.get('load_factor', self.load_factor) # Incase the user wants to override the mission load factor, they have the oppurtunity to. 
-        bearing_temp = commands.get('bearing_temperature', 20.0)
-        dt = commands.get('timestep_hours', 1.0)
+        load_factor = commands.get('load_factor', self.load_factor) # In case the user wants to override the mission load factor, they have the opportunity to. 
 
         op_conditions = {
             'speed_rpm': speed_rpm,
-            'bearing_temp': bearing_temp,
             'load_factor': load_factor,
         }
         
-        # Update bearing state
-        self.bearing_state = self.bearing_model.update_bearing_state(self.bearing_state, op_conditions, dt)
-        physics = self.bearing_model.get_physical_properties(self.bearing_state)
+        # Update bearing state for each hour in the timestep
+        # The bearing physics model requires hour-by-hour updates for accuracy
+        num_hours = int(timestep_hours)
+        for hour in range(num_hours): 
+            self.bearing_state = self.bearing_model.update_bearing_state_one_hour(self.bearing_state, op_conditions)
+
 
         # Translate bearing state to subsystem signals
-        vibration = self._physics_to_vibration(physics)
-        current = self._physics_to_current(physics, speed_rpm)
-        housing_temp = self._physics_to_temperature(physics, load_factor)
+        vibration = self._physics_to_vibration()
+        current = self._physics_to_current(speed_rpm)
+        housing_temp = self._physics_to_temperature(load_factor)
 
-    
         # Store for export/streaming
+        # Note: mission_time_hours will be added by the telemetry generator
         self.latest_telemetry = {
-            'mission_time_hours': mission_time_hours,
+            'timestep_hours': timestep_hours,
             'mode': commands.get('mode', self.operational_mode),
             'wheel_id': self.wheel_id,
             'speed_rpm': speed_rpm,
             'load_factor': load_factor,
-            'bearing_wear_level': physics['wear_level'],
-            'bearing_friction_coeff': physics['friction_coefficient'],
-            'bearing_surface_roughness': physics['surface_roughness'],
-            'bearing_lubrication_quality': physics['lubrication_quality'],
-            'measured_vibration': vibration,
-            'motor_current': current,
+            
+            # Bearing physics state
+            'wear_level': self.bearing_state.wear_level,
+            'friction_coefficient': self.bearing_state.friction_coefficient,
+            'surface_roughness': self.bearing_state.surface_roughness,
+            'lubrication_quality': self.bearing_state.lubrication_quality,
+            'bearing_temperature': self.bearing_state.bearing_temperature,
+            
+            # Observable sensor measurements
+            'vibration': vibration,
+            'current': current,
             'housing_temperature': housing_temp,
         }
 
 
-    def _physics_to_vibration(bearing_physics):
+    def _physics_to_vibration(self):
         """
         Converts physics state to vibration RMS (arbitrary units for demo).
         Vibration increases as wear, roughness, and friction rise.
@@ -85,17 +92,17 @@ class ReactionWheelSubsystem:
         """
         BASE_VIBRATION = 0.01  # g, minimum healthy wheel baseline
         VIBRATION_WEAR_GAIN = 0.04  # g per unit wear
-        VIBRATION_ROUGHNESS_GAIN = 0.07  # g per μm roughness above baseline
-        VIBRATION_FRICTION_GAIN = 0.1   # g per unit friction above 0.02
+        VIBRATION_ROUGHNESS_GAIN = 0.007  # g per μm roughness above baseline
+        VIBRATION_FRICTION_GAIN = 1.0   # g per unit friction above 0.02
 
         vib = (BASE_VIBRATION
-               + VIBRATION_WEAR_GAIN * physics['wear_level']
-               + VIBRATION_ROUGHNESS_GAIN * max(0, physics['surface_roughness'] - 0.32)
-               + VIBRATION_FRICTION_GAIN * (physics['friction_coefficient'] - 0.02))
+               + VIBRATION_WEAR_GAIN * self.bearing_state.wear_level
+               + VIBRATION_ROUGHNESS_GAIN * max(0, self.bearing_state.surface_roughness - 0.32)  # Roughness above baseline
+               + VIBRATION_FRICTION_GAIN * max(0, self.bearing_state.friction_coefficient - 0.02))
         return vib
 
 
-    def _physics_to_current(bearing_physics, wheel_speed):
+    def _physics_to_current(self, wheel_speed):
         """
         Estimates motor current draw (A).
         Increases with friction and wheel speed.
@@ -104,25 +111,26 @@ class ReactionWheelSubsystem:
         Current rises by ~0.2–0.5A per 0.1 increase in friction coefficient and climbs rapidly at high RPM. 
         Scaling by friction and RPM is supported by hardware models and NASA jitter reports.
         """
-        IDLE_CURRENT = 0.08  # A, low-load (0.05–0.12A typical for cubesat class)[64]
+        IDLE_CURRENT = 0.08  # A, low-load (0.05–0.12A typical for cubesat class)
         CURRENT_GAIN = 0.3   # A per unit friction * speed/1000
 
-        load = CURRENT_GAIN * physics['friction_coefficient'] * abs(wheel_speed) / 1000.0
+        load = CURRENT_GAIN * self.bearing_state.friction_coefficient * abs(wheel_speed) / 1000.0
         return IDLE_CURRENT + load
 
 
-    def _physics_to_temperature(bearing_physics, operational_load):
+    def _physics_to_temperature(self, operational_load):
         """
         Approximates wheel housing temperature (deg C).
         Increases with operating load and friction.
 
         Literature: Housing temperature for wheels rarely exceeds ambient by more than a few °C under normal operations, 
         but with increased friction and load, rises of +2–5°C or more are plausible, especially in vacuum or poor conduction cases.
-
         """
         AMBIENT_TEMP = 20.0
         TEMP_FRICTION_GAIN = 3.0  
-        delta = TEMP_FRICTION_GAIN * physics['friction_coefficient'] * operational_load
+        TEMP_LOAD_GAIN = 5.0
+        delta = (TEMP_FRICTION_GAIN * self.bearing_state.friction_coefficient + 
+                TEMP_LOAD_GAIN * max(0, operational_load - 1.0))
         return AMBIENT_TEMP + delta
 
     def get_performance_metrics(self):
@@ -135,13 +143,16 @@ class ReactionWheelSubsystem:
         MAX_TORQUE_NM = 0.05                             # Newton meter, de-rates as wear grows (engineering typical)
         POINTING_JITTER_BASE_ARCSEC = 0.1                # arcsec, best-case pointing stability (high-precision mission)
         POINTING_JITTER_VIBRATION_GAIN = 20              # arcsec per .01g increase in vibration
+        
+        current_vibration = self.latest_telemetry.get('measured_vibration', 0.01)
+        
         metrics = {
             'max_torque_Nm': max(0.0, MAX_TORQUE_NM * (1 - self.bearing_state.wear_level)),  # Declines with wear
-            'pointing_jitter_arcsec': POINTING_JITTER_BASE_ARCSEC + POINTING_JITTER_VIBRATION_GAIN * self.latest_telemetry.get('measured_vibration', 0.01)  # Vibration causes pointing error
+            'pointing_jitter_arcsec': POINTING_JITTER_BASE_ARCSEC + POINTING_JITTER_VIBRATION_GAIN * current_vibration  # Vibration causes pointing error
         }
         return metrics
      
-    def predict_maintenance_timeline(current_state, mission_profile):
+    def predict_maintenance_timeline(self, mission_profile):
         """
         Projects maintenance/failure horizon (hours) using internal physics.
         mission_profile: dict with typical profile for coming operation (temp, load_factor)
@@ -154,3 +165,13 @@ class ReactionWheelSubsystem:
     def get_telemetry(self):
         """Return the latest telemetry dictionary"""
         return self.latest_telemetry
+
+    def get_bearing_state_dict(self):
+        """Return current bearing state as dictionary for easy access"""
+        return {
+            'wear_level': self.bearing_state.wear_level,
+            'friction_coefficient': self.bearing_state.friction_coefficient,
+            'surface_roughness': self.bearing_state.surface_roughness,
+            'lubrication_quality': self.bearing_state.lubrication_quality,
+            'bearing_temperature': self.bearing_state.bearing_temperature
+        }
