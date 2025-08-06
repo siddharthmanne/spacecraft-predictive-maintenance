@@ -9,6 +9,7 @@ Integrates user commands, mission profiles, and bearing physics for E2E RW model
 """
 
 import random
+import numpy as np
 from src.bearing_degradation import BearingDegradationModel, BearingState
 
 
@@ -42,17 +43,18 @@ class ReactionWheelSubsystem:
     def __init__(self, 
                 wheel_id=0, # Since most real spacecraft have 3–4 reaction wheels (for full 3-axis + redundancy control)
                 operational_mode='IDLE', # "IDLE" is a common and safe default state in spacecraft systems. UI allows users to select or change operational modes (such as 'IDLE', 'NOMINAL', 'SAFE', 'HIGH_TORQUE', etc.)
-                load_factor=1.0): # Considered an initialization parameter since load factor can be thought of as a mission property
+                spacecraft_payload=0.0,
+                maneuvering=False): 
         self.bearing_model = BearingDegradationModel()
         self.bearing_state = BearingState()
         self.operational_mode = operational_mode
-        self.load_factor = load_factor
+        self.spacecraft_payload = spacecraft_payload
         self.wheel_id = wheel_id
 
         # Telemetry storage
         self.latest_telemetry = {}
 
-    def update(self, mission_time_hours, commands):
+    def update_one_hour(self, commands):
         """
         Main orchestration function.
         - Decodes commands to operating conditions
@@ -61,35 +63,36 @@ class ReactionWheelSubsystem:
         - Packages telemetry dictionary
 
         Inputs:
-            mission_time_hours: current mission time (float)
-            commands: dict, e.g. {'target_speed_rpm': 3600, 'load_factor': 1.2, 'mode': 'NOMINAL'}
+            commands: dict, e.g. {'target_speed_rpm': 3600, 'spacecraft_payload': 1200, 'mode': 'NOMINAL'}
         """
         speed_rpm = commands.get('target_speed_rpm', 0.0)
-        load_factor = commands.get('load_factor', self.load_factor) # Incase the user wants to override the mission load factor, they have the oppurtunity to. 
-        dt = commands.get('timestep_hours', 1.0)
+        spacecraft_payload = commands.get('spacecraft_payload', self.spacecraft_payload) # Incase the user wants to override the mission payload, they have the oppurtunity to. 
+        maneuvering = commands.get('maneuvering', False)
 
         op_conditions = {
             'speed_rpm': speed_rpm,
-            'load_factor': load_factor,
+            'spacecraft_payload': spacecraft_payload,
+            'maneuvering': maneuvering
         }
         
         # Update bearing state
-        self.bearing_state = self.bearing_model.update_bearing_state(self.bearing_state, op_conditions, dt)
+        self.bearing_state = self.bearing_model.update_bearing_state_one_hour(self.bearing_state, op_conditions)
 
         # Translate bearing state to subsystem signals
         vibration = self._physics_to_vibration()
         current = self._physics_to_current(speed_rpm)
-        housing_temperature = self._physics_to_housing_temperature(load_factor)
+        housing_temperature = self._physics_to_housing_temperature(op_conditions, current)
 
     
         # Store for export/streaming
         self.latest_telemetry = {
             # Intrinsic physical values
-            'mission_time_hours': mission_time_hours,
             'mode': commands.get('mode', self.operational_mode),
+            'maneuvering': maneuvering,
+            'bearing_load_N': self.bearing_model.bearing_load_N,  # Newtons, calculated from RPM and payload
             'wheel_id': self.wheel_id,
             'speed_rpm': speed_rpm,
-            'load_factor': load_factor,
+            'spacecraft_payload': spacecraft_payload,
             'bearing_wear_level': self.bearing_state.wear_level,
             'bearing_friction_coeff': self.bearing_state.friction_coefficient,
             'bearing_surface_roughness': self.bearing_state.surface_roughness,
@@ -142,7 +145,7 @@ class ReactionWheelSubsystem:
         return base_current
 
 
-    def _physics_to_housing_temperature(self, operational_load):
+    def _physics_to_housing_temperature(self, operating_conditions, motor_current=None):
         """
         Approximates wheel housing temperature (deg C).
         Increases with operating load and friction.
@@ -152,6 +155,22 @@ class ReactionWheelSubsystem:
         Heat generation outweighs dissipation as friction grows, leading to net temperature rise.
 
         """
+        # Heat source 1: Bearing friction
+        surface_velocity = operating_conditions['speed_rpm'] * 2 * np.pi / 60 * self.bearing_model.physics_constants['bearing_radius']  # m/s
+        bearing_friction_heat = self.bearing_state.friction_coefficient * self.bearing_state.bearing_load * surface_velocity
+        
+        #Heat source 2: Motor losses
+        speed_factor = abs(operating_conditions['speed_rpm']) / 1000.0  # Scale speed for current draw
+        mass_factor = operating_conditions.get('spacecraft_payload', 1.0) / 1000.0  # kg
+        base_motor_heat = 0.5  # Watts
+
+        maneuver_heat = base_motor_heat * speed_factor * mass_factor * 0.1  # Scale with speed and payload
+        total_motor_heat = base_motor_heat + maneuver_heat
+
+        total_heat_watts = bearing_friction_heat + total_motor_heat
+
+        return (self.HOUSING_TEMPERATURE_BASE + total_heat_watts * 0.1)  # Convert watts to temperature rise, assuming 10% efficiency in heat dissipation
+
         # Base temperature rise from friction
         friction_delta = self.TEMP_FRICTION_GAIN * self.bearing_state.friction_coefficient * operational_load
 

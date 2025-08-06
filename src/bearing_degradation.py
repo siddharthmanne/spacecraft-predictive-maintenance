@@ -28,6 +28,7 @@ class BearingState:
     surface_roughness: float = 0.32      # micrometers, new bearing baseline roughness
     lubrication_quality: float = 1.0    # New bearing has near perfect lubrication
     bearing_temperature: float = 20.0   # New bearing runs at typical spacecraft lower bound (since usual operating range is 15-20C)
+    bearing_load: float = 30.0 # Base bearing preload in newton
 
 @dataclass
 class BearingDegradationModel:
@@ -48,15 +49,26 @@ class BearingDegradationModel:
         self.physics_constants = {
             # Base depletion rates
             'wear_rate_base': 1.2e-6,           # Reduced from 7.5e-6 to reach ~1.0 over 10 years
-            'lubrication_depletion_rate': 2.5e-6, # Per operating hour
-            'wear_activation_energy': 9.0e20, # Activation energy for wear acceleration (Joules)
+            'lubrication_depletion_rate': 2.0e-5, # Per operating hour
+
+            # Constants
+            'wear_activation_energy': 2e4, # Activation energy for wear acceleration (Joules)
             'load_stress_exponent': 1.0,      # Load stress relationship
+            'reference_temperature': 20.0,
+            'baseline_surface_roughness': 0.32,  # μm, new bearing baseline
+            'thermal_capacity': 0.8,               # Thermal inertia factor for temperature history
+            'boltzmann_constant': 1.380649e-23,  # J/K, for physics calculations
 
             # Dependencies
             'lubrication_temp_factor': 0.5,  #increased temperature acceleration factor
             'surface_roughness_factor': 0.8,       # μm increase per wear unit
             'friction_increase_factor': 0.7,        # Friction coefficient increase
-            'heat_generation_factor': 3.5,         # Temperature rise per unit friction increase
+            'heat_generation_factor': 0.35,         # Temperature rise per unit friction increase
+            'thermal_conductance': 5.0,   # W/°C, example value—calibrate experimentally
+            'mass_cp': 1000.0,             # J/°C, combined bearing mass×specific heat
+            'gas_constant': 8.314,         # J/(mol·K), universal gas constant
+            'lubrication_activation_energy': 5e4,  # J/mol, typical activation energy for grease oxidation
+
 
             # Critical thresholds
             'critical_temperature_threshold': 50.0,  # Temp at which lubrication quality begins decreasing significantly
@@ -67,37 +79,37 @@ class BearingDegradationModel:
             'extreme_temperature_threshold': 80.0,        # Temperature threshold for discrete lubrication failure
             'max_surface_roughness': 8.0,        # Maximum roughness in micrometers
             'min_lubrication_quality': 0.05,       # Minimum residual lubrication
-              
-            'reference_temperature': 20.0,
-            'baseline_surface_roughness': 0.32,  # μm, new bearing baseline
-            'thermal_capacity': 0.8,               # Thermal inertia factor for temperature history
-            'boltzmann_constant': 1.380649e-23,  # J/K, for physics calculations
-            'thermal_conductance': 0.5,   # W/°C, example value—calibrate experimentally
-            'mass_cp': 100.0,             # J/°C, combined bearing mass×specific heat
-            'gas_constant': 8.314,         # J/(mol·K), universal gas constant
-            'lubrication_activation_energy': 75e3,  # J/mol, typical activation energy for grease oxidation
-
+            
             # Surface roughness and debris physics
             'running_in_duration': 0.05,  # Wear level where running-in completes (5%)
-            'running_in_smoothing': 0.8,  # Roughness reduction factor during running-in
+            'running_in_smoothing': 0.98, # 2% smoothing factor (reduction in surface roughness) during run-in
             'debris_onset_wear': 0.15,    # Earlier debris generation (15% instead of 50%)
             'debris_size_factor': 2.5,    # Particle size growth with wear
             'debris_contamination_threshold': 0.3,  # When debris contamination dominates
-            'roughness_wear_exponent': 1.8,  # Non-linear roughness-wear relationship
+            'roughness_wear_exponent': 0.2,  # Non-linear roughness-wear relationship
             'max_debris_acceleration': 50.0,  # Higher realistic maximum
 
             # --- Friction model constants ---
-            'viscosity_ref':          0.09,   # Pa·s at reference_temperature (example space-qualified grease)
-            'viscosity_activation':   6.0e3,  # J/mol, viscosity’s Arrhenius slope
+            'lubrication_viscosity_ref':          0.09,   # Pa·s at reference_temperature (example space-qualified grease)
+            'viscosity_activation':   1.0e4,  # J/mol, activation energy for viscous flow (energy molecules need to overcome IMF)
             'stribeck_exponent':      0.75,   # Stribeck curve slope (µ ~ (ηV/P)^-n) in mixed regime
             'asperity_plough_factor': 0.8,    # Additional µ per µm roughness when debris dominates
             'debris_friction_limit':  0.18,   # Upper µ when severe debris present
             'temperature_friction_slope': 1.5e-3,  # ∆µ per °C above reference (thin-film thinning)
+
+             # Bearing load constants
+            'bearing_preload_N': 30.0,           # Axial preload in Newtons
+            'rotor_mass_kg': 10.0,               # Actual rotor mass
+            'imbalance_factor': 1e-6,            # Manufacturing imbalance (kg⋅m)
+            'design_load_N': 50.0,               # Design load for normalization
+            'bearing_radius': 0.01,              # Bearing radius in meters
+            'maneuver_torque_factor': 0.1 # DImensionless scaling factor
         }
+        
 
 
     # CORE SIMULATION FUNCTIONS
-    def update_bearing_state(self, current_state: BearingState, operating_conditions: Dict[str, float], time_delta_hours: float) -> BearingState:
+    def update_bearing_state_one_hour(self, current_state: BearingState, operating_conditions: Dict[str, float]) -> BearingState:
         """
         CORE FUNCTION: Updates bearing wear based on operating conditions
         Called every simulation timestep (1 hour) by Reaction Wheel class
@@ -115,17 +127,18 @@ class BearingDegradationModel:
 
         # Extract contextual operating conditions
         speed_rpm = operating_conditions.get('speed_rpm', 0.0) # If missing, assume stopped
-        load_factor = operating_conditions.get('load_factor', 1.0) # If missing, assume nominal load
+        payload = operating_conditions.get('spacecraft_payload', 0) # If missing, assume nominal payload
+        self.bearing_load_N = self._calculate_bearing_load(speed_rpm, operating_conditions)
 
         # 1) Calculate incremental wear when rotating
         if speed_rpm > 0:
-            # Physics-based wear progression using Archard's wear law
+            # Temperature factor for wear acceleration
             R = self.physics_constants['gas_constant']  # J/(mol·K)
             Ea_wear = self.physics_constants['wear_activation_energy']  # J/mol
             T_K = current_state.bearing_temperature + 273.15
             T_ref_K = self.physics_constants['reference_temperature'] + 273.15
 
-            temp_factor = np.exp(-Ea_wear/R * (1/T_K - 1/T_ref_K))
+            temp_factor = np.exp(Ea_wear/R * (1/T_ref_K - 1/T_K))
                                 
             # Hertzian contact stress relationship
             # load_factor_adj = load_factor ** self.physics_constants['load_stress_exponent']
@@ -134,20 +147,23 @@ class BearingDegradationModel:
             base_wear = (
                 self.physics_constants['wear_rate_base'] * 
                 temp_factor *
-                load_factor *
-                time_delta_hours
-            )
+                self.bearing_load_N 
+                )
 
             # State dependent acceleration in wear
             wear_acceleration = self._calculate_wear_acceleration(current_state)
 
-            total_wear_increment = base_wear * wear_acceleration
+            # Calculate load-dependent wear using actual bearing forces
+            load_stress_factor = (self.bearing_load_N / self.physics_constants['design_load_N']) ** self.physics_constants['load_stress_exponent']
+
+            total_wear_increment = base_wear * wear_acceleration * load_stress_factor
 
         else:
             total_wear_increment = 0.0
 
-        # 2) Update lubrication quality (accelerates with wear)
-        lubrication_loss = self._calculate_lubrication_loss(current_state, current_state.bearing_temperature, time_delta_hours)
+        # 2) Calculate lubrication loss (accelerates with wear)
+        lubrication_loss = self._calculate_lubrication_loss(current_state, current_state.bearing_temperature)
+    
 
         # 3) Surface roughness with debris-driven acceleration
         new_surface_roughness = self._calculate_surface_roughness(
@@ -156,22 +172,26 @@ class BearingDegradationModel:
 
         # 4) Update friction coefficient based on wear and surface condition
         new_friction = self._calculate_friction_coefficient(
-        current_state,
-        total_wear_increment,
-        speed_rpm=speed_rpm,
-        load_N=operating_conditions.get('radial_load_N', 1.0)
-)
+                        current_state,
+                        total_wear_increment,
+                        speed_rpm=speed_rpm,
+                        load_N=self.bearing_load_N
+        )
 
-        # 5) Compute net heat flow: Q_gen from friction minus Q_loss via conduction
+        # 5) Heat
+        # Nearly all mechanical work done by friction becomes heat. Power generated by friction is τ(friction torque) * ω(angular speed)
         # Q_gen is joules per second generated by friction
-        Q_gen = self.physics_constants['heat_generation_factor'] * new_friction * load_factor * max(1.0, speed_rpm/1000)
+        # Calculate actual bearing load in Newtons
+        bearing_radius = self.physics_constants['bearing_radius'] # meters
+        surface_velocity = speed_rpm * 2 * np.pi/60 * bearing_radius # m/s
+        Q_gen = self.physics_constants['heat_generation_factor'] * new_friction * self.bearing_load_N * surface_velocity
         #hA is conductive heat loss to housing
         hA = self.physics_constants['thermal_conductance']  # W/°C, add this constant
         mass_cp = self.physics_constants['mass_cp']         # J/°C, add this constant
 
         # dT/dt = (Q_gen - hA*(T - Tambient)) / (m·c_p)
         dT = (Q_gen - hA*(current_state.bearing_temperature - self.physics_constants['reference_temperature'])) \
-            * (time_delta_hours * 3600) / mass_cp
+            * (1 * 3600) / mass_cp
 
         new_bearing_temperature = current_state.bearing_temperature + dT
 
@@ -224,7 +244,7 @@ class BearingDegradationModel:
         # Cap acceleration to prevent numerical instability (q5x max)
         return min(self.physics_constants['max_debris_acceleration'], total_acceleration)
 
-    def _calculate_lubrication_loss(self, bearing_state: BearingState, bearing_temperature: float, time_delta_hours: float) -> float:
+    def _calculate_lubrication_loss(self, bearing_state: BearingState, bearing_temperature: float) -> float:
         """
         Calculate lubrication degradation using grease chemistry kinetics.
         
@@ -242,7 +262,7 @@ class BearingDegradationModel:
         
         Returns: Lubrication quality loss (0.0 to 1.0 scale)
         """
-        base_loss = self.physics_constants['lubrication_depletion_rate'] * time_delta_hours
+        base_loss = self.physics_constants['lubrication_depletion_rate'] 
 
         #Arrhenius temperature acceleration
         Ea_lube = self.physics_constants['lubrication_activation_energy']  
@@ -257,8 +277,8 @@ class BearingDegradationModel:
         
         # Wear particle contamination effect
         # Metal particles catalyze grease oxidation
-        contamination_factor = 1.0 + 5.0 * bearing_state.wear_level
-        
+        contamination_factor = 1 + 5.0 * bearing_state.wear_level
+
         # Total lubrication loss
         total_loss = base_loss * temp_acceleration * contamination_factor
         
@@ -280,34 +300,21 @@ class BearingDegradationModel:
         """
         current_roughness = bearing_state.surface_roughness
         wear_level = bearing_state.wear_level
-        baseline = self.physics_constants['baseline_surface_roughness']
+        base_change = wear_increment * self.physics_constants['surface_roughness_factor'] # Dependence between wear and surface roughness
 
         # Phase 1: Running-in (initial smoothing)
         if wear_level < self.physics_constants['running_in_duration']:
-            # New bearings actually get smoother initially
-            smoothing_factor = self.physics_constants['running_in_smoothing']
-            target_roughness = baseline * smoothing_factor
-            
-            # Exponential approach to smoother surface
-            smoothing_rate = 5.0  # How quickly running-in occurs
-            progress = wear_level / self.physics_constants['running_in_duration']
-            running_in_roughness = baseline + (target_roughness - baseline) * (1 - np.exp(-smoothing_rate * progress))
-            
-            # Base roughness change from wear
-            base_change = wear_increment * self.physics_constants['surface_roughness_factor']
-            return max(running_in_roughness + base_change, target_roughness)
+            # New bearings actually get slightly smoother initially
+            return 0.98 * (current_roughness + base_change)  # 2% smoothing factor
         
         # Phase 2: Normal wear progression  
         elif wear_level < self.physics_constants['debris_onset_wear']:
             # Standard roughness increase with non-linear wear relationship
-            base_change = wear_increment * self.physics_constants['surface_roughness_factor']
             wear_factor = (wear_level ** self.physics_constants['roughness_wear_exponent'])
             return current_roughness + base_change * (1.0 + wear_factor)
         
         # Phase 3: Debris generation begins
-        elif wear_level < self.physics_constants['debris_contamination_threshold']:
-            base_change = wear_increment * self.physics_constants['surface_roughness_factor']
-            
+        elif wear_level < self.physics_constants['debris_contamination_threshold']:    
             # Debris particle generation acceleration
             debris_progress = (wear_level - self.physics_constants['debris_onset_wear']) / \
                             (self.physics_constants['debris_contamination_threshold'] - self.physics_constants['debris_onset_wear'])
@@ -321,9 +328,7 @@ class BearingDegradationModel:
             return current_roughness + base_change * debris_acceleration
         
         # Phase 4: Debris contamination dominates
-        else:
-            base_change = wear_increment * self.physics_constants['surface_roughness_factor']
-            
+        else:            
             # Severe contamination effects
             contamination_level = wear_level - self.physics_constants['debris_contamination_threshold']
             contamination_factor = min(self.physics_constants['max_debris_acceleration'], 
@@ -338,6 +343,8 @@ class BearingDegradationModel:
             # Cap at maximum physical roughness
             return min(new_roughness, self.physics_constants['max_surface_roughness'])
 
+    
+
     def _calculate_friction_coefficient(
             self,
             bearing_state: BearingState,
@@ -345,56 +352,6 @@ class BearingDegradationModel:
             speed_rpm: float = 0.0,
             load_N: float = 1.0
     ) -> float:
-        """
-        Mixed-regime friction model with Stribeck behaviour, roughness & debris effects.
-        """
-        # ---------- 1. Hydrodynamic / mixed-film component ----------
-        # Dynamic viscosity Arrhenius drop with temperature
-        R = self.physics_constants['gas_constant']
-        eta_ref = self.physics_constants['viscosity_ref']
-        Ea_eta = self.physics_constants['viscosity_activation']
-        
-        T_K = bearing_state.bearing_temperature + 273.15
-        T_ref_K = self.physics_constants['reference_temperature'] + 273.15
-        eta = eta_ref * np.exp(-Ea_eta/R * (1/T_K - 1/T_ref_K))
-        
-        # Sommerfeld number proxy: (η·V) / P   — V≈π·d·speed, use speed_rpm scaled
-        V = max(speed_rpm, 1.0) * 2*np.pi/60  # rad/s proxy
-        P = max(load_N, 1.0)                  # normalise if you don’t have real load
-        mixed_mu = 0.008 * (eta*V/P) ** (-self.physics_constants['stribeck_exponent'])
-        
-        # ---------- 2. Boundary / asperity component ----------
-        # Base steel-on-steel boundary µ
-        base_boundary_mu = 0.02
-        
-        # Roughness contribution (non-linear)
-        rough_ratio = bearing_state.surface_roughness / self.physics_constants['baseline_surface_roughness']
-        asperity_mu = base_boundary_mu + (rough_ratio - 1.0) * self.physics_constants['asperity_plough_factor'] * 0.01
-        
-        # Lubrication film penalty (goes up as lube_quality ↓)
-        lube_penalty = 1.0 + 3.0 * (1.0 - bearing_state.lubrication_quality) ** 0.7
-        
-        # Debris penalty – significant when roughness already high or wear > 30 %
-        if bearing_state.wear_level > 0.3:
-            debris_penalty = 1.0 + 4.0 * (bearing_state.wear_level - 0.3)
-        else:
-            debris_penalty = 1.0
-        
-        boundary_mu = asperity_mu * lube_penalty * debris_penalty
-        
-        # ---------- 3. Temperature-induced thin-film rise ----------
-        temp_penalty = 1.0 + self.physics_constants['temperature_friction_slope'] * \
-                    max(0.0, bearing_state.bearing_temperature - self.physics_constants['reference_temperature'])
-        
-        # ---------- 4. Combine using harmonic mean (common in mixed lubrication) ----------
-        combined_mu = 1.0 / (1.0/mixed_mu + 1.0/boundary_mu)
-        combined_mu *= temp_penalty
-        
-        # Physical upper bound
-        combined_mu = min(combined_mu, self.physics_constants['debris_friction_limit'])
-        return combined_mu
-
-    # def _calculate_friction_coefficient(self, bearing_state: BearingState, wear_increment: float) -> float: 
         """ WHAT IS THE ROLE OF SECOND PARAMETER"""
         """
         Calculate friction coefficient based on surface condition and lubrication.
@@ -544,3 +501,112 @@ class BearingDegradationModel:
             'hit_rate_percent': round(hit_rate, 1),
             'cached_items': len(self._physics_cache)
         }
+    
+
+
+    def _calculatex_friction_coefficient(
+            self,
+            bearing_state: BearingState,
+            wear_increment: float,
+            speed_rpm: float = 0.0,
+            load_N: float = 1.0
+    ) -> float:
+        """
+        Mixed-regime friction model with Stribeck behaviour, roughness & debris effects.
+        """
+        # ---------- 1. Hydrodynamic / mixed-film component ----------
+        # Viscosity of lubrication decreases exponentially with temperature
+        # Use Arrhenius equation to model viscosity change with temperature
+        R = self.physics_constants['gas_constant']
+        eta_ref = self.physics_constants['lubrication_viscosity_ref'] # Reference viscosity of lubrication
+        Ea_eta = self.physics_constants['viscosity_activation'] # Activation energy for viscosity change (higher viscosity activation energy means viscosity changes more with temperature)
+        
+        T_K = bearing_state.bearing_temperature + 273.15
+        T_ref_K = self.physics_constants['reference_temperature'] + 273.15
+        eta = eta_ref * np.exp(-Ea_eta/R * (1/T_K - 1/T_ref_K))
+        
+        # Sommerfeld number proxy, determines lubrication regime (eta*V/P)
+        V = max(speed_rpm, 1.0) * 2*np.pi/60  # V is Surface velocity: represents how fast bearing surfaces are moving relative to one another. max() prevents division by zero, and 2*np.pi/60 converts rpm to rad/s
+        P = max(load_N, 1.0)                  # P is applied load. prevents division by zero by ensuring min load of 1.0
+        S = (eta * V) / P
+        stribeck_low = 1e-7
+        stribeck_high = 5e-5
+
+        if S < stribeck_low:
+            # Pure boundary regime
+            mixed_mu = boundary_mu
+        elif S > stribeck_high:
+            # Pure hydrodynamic regime
+            mixed_mu = min(mixed_mu, boundary_mu)  # Or set to a minimum hydrodynamic friction (rare in small bearings)
+        else:
+            # Mixed regime: interpolate between boundary and hydrodynamic/mixed
+            alpha = (S - stribeck_low) / (stribeck_high - stribeck_low)
+            mixed_mu = (1 - alpha) * boundary_mu + alpha * mixed_mu
+        # Stribeck curve: As speed inc/load dec, friction can reduce due to hydrodynamic effects 
+        # mixed_mu calculates the dynamic viscosity of lubricant
+        # Thick lubricant film has low friction, thin film has high friction
+        # mixed_mu = 0.008 * (eta*V/P) ** (-self.physics_constants['stribeck_exponent'])
+        
+        # ---------- 2. Boundary / asperity component ----------
+        # Base steel-on-steel boundary µ
+        base_boundary_mu = 0.02
+        
+        # Roughness contribution (non-linear)
+        # If roughness = baseline -> rough_ratio = 1.0 -> no penalty
+        # If roughness > baseline -> rough_ratio > 1.0 -> friction inc
+        # If roughness < baseline -> rough_ratio < 1.0 -> friction dec 
+        # Roughness is in micrometers, so we normalize to baseline roughness
+        # Asperity ploughing: rough peaks dig into opposing surfaces, leading to friction increase
+        rough_ratio = bearing_state.surface_roughness / self.physics_constants['baseline_surface_roughness']
+        asperity_mu = base_boundary_mu + (rough_ratio - 1.0) * self.physics_constants['asperity_plough_factor'] * 0.01
+        
+        # Lubrication film penalty (goes up as lube_quality ↓)
+        lube_penalty = 1.0 + 3.0 * (1.0 - bearing_state.lubrication_quality) ** 0.7
+        
+        # Debris penalty – significant when roughness already high or wear > debris_threshold_wear
+        if bearing_state.wear_level > self.physics_constants['debris_threshold_wear']:
+            debris_penalty = 1.0 + 4.0 * (bearing_state.wear_level - self.physics_constants['debris_threshold_wear'])
+        else:
+            debris_penalty = 1.0
+        
+        # Rough surfaces AND poor lube AND high wear all contribute to boundary friction
+        boundary_mu = asperity_mu * lube_penalty * debris_penalty
+        
+        # ---------- 3. Temperature-induced thin-film rise ----------
+        # Beyond viscosity changes, high temp can also cause chemical degradation
+        temp_penalty = 1.0 + self.physics_constants['temperature_friction_slope'] * \
+                    max(0.0, bearing_state.bearing_temperature - self.physics_constants['reference_temperature'])
+        
+        # ---------- 4. Combine using harmonic mean (common in mixed lubrication) ----------
+        combined_mu = 1.0 / (1.0/mixed_mu + 1.0/boundary_mu)
+        combined_mu *= temp_penalty
+        
+        # Physical upper bound
+        combined_mu = min(combined_mu, self.physics_constants['debris_friction_limit'])
+        return combined_mu
+    
+    def _calculate_bearing_load(self, speed_rpm: float, operating_conditions: Dict[str, float]) -> float:
+        """
+        Calculate the bearing load based on speed and operating conditions.
+        Returns: bearing load in Newtons.
+        """
+
+        # Static bearing preload (this is built into the bearing)
+        bearing_preload_N = self.physics_constants.get('bearing_preload_N', 30.0)
+    
+        # Dynamic radial load from rotor imbalance
+        rotor_mass_kg = self.physics_constants.get('rotor_mass_kg', 10.0)
+        imbalance_factor = self.physics_constants.get('imbalance_factor', 1e-6)  # kg⋅m
+        omega_rad_s = speed_rpm * 2 * np.pi / 60
+        radial_load_N = imbalance_factor * (omega_rad_s ** 2)
+
+        spacecraft_payload = operating_conditions.get('spacecraft_payload', 0.0)  # kg
+        if operating_conditions.get('maneuvering', True):
+            maneuver_load_N = spacecraft_payload * self.physics_constants['maneuver_torque_factor'] * 1e-4  # Scaling factor
+        else:
+            maneuver_load_N = 0.0
+        
+        # Combined bearing load (simplified vector addition)
+        total_load_N = np.sqrt(bearing_preload_N**2 + radial_load_N**2 + maneuver_load_N**2)
+        
+        return total_load_N
